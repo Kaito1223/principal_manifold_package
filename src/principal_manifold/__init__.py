@@ -1,5 +1,6 @@
 from ._types import CurveSnapshot, PrincipalCurveResult, GraphSnapshot, PrincipalGraphResult
 from .curves import HSConfig, HSPrincipalCurve, OptimizerConfig, KeglKrzyzakConfig, KeglKrzyzakPrincipalCurve
+from .regression import PrincipalManifoldRegressor, RegressionPredictionResult
 from .elastic import (
     Edge,
     Star,
@@ -39,4 +40,6 @@ __all__ = [
     "ElasticPrincipalGraph",
     "PrincipalElasticGraph",
     "ElasticGraphFramework",
+    "PrincipalManifoldRegressor",
+    "RegressionPredictionResult",
 ]

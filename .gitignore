@@ -8,3 +8,4 @@ dist/
 *.png
 *.npy
 *.json
+*.npz
