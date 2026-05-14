@@ -134,7 +134,7 @@ def plot_principal_tree_snapshot_2d(X, snapshot, ax=None, title: Optional[str] =
     layout = _metro_layout_tree(vertices, edges, X=X)
 
     if ax is None:
-        _, ax = plt.subplots(figsize=(7, 5))
+        _, ax = plt.subplots(figsize=(10, 7))
 
     nearest = _nearest_node_indices(X, vertices)
     counts = np.bincount(nearest, minlength=vertices.shape[0]).astype(float)
@@ -142,9 +142,9 @@ def plot_principal_tree_snapshot_2d(X, snapshot, ax=None, title: Optional[str] =
 
     if len(edges) > 0:
         segs = np.stack([layout[edges[:, 0]], layout[edges[:, 1]]], axis=1)
-        ax.add_collection(LineCollection(segs, linewidths=2, alpha=0.95))
+        ax.add_collection(LineCollection(segs, linewidths=2, alpha=0.95, colors="black"))
 
-    ax.scatter(layout[:, 0], layout[:, 1], s=sizes, alpha=0.95, zorder=3)
+    ax.scatter(layout[:, 0], layout[:, 1], s=sizes, alpha=0.95, zorder=3, label="tree vertices; size proportional to assigned data points",)
     for i, (x, y) in enumerate(layout):
         ax.text(x, y, str(i), fontsize=8, ha="center", va="center", zorder=4)
 
@@ -165,7 +165,7 @@ def save_principal_tree_trace_frames_2d(X, snapshots, output_dir="principal_tree
     output_dir.mkdir(parents=True, exist_ok=True)
 
     for idx, snapshot in enumerate(snapshots):
-        fig, ax = plt.subplots(figsize=(7, 5))
+        fig, ax = plt.subplots(figsize=(10, 7))
         plot_principal_tree_snapshot_2d(X, snapshot, ax=ax)
 
         filename = f"{idx:03d}_outer_{snapshot.outer_iteration:03d}_{snapshot.phase}"

@@ -11,6 +11,7 @@ from principal_manifold import (
     KeglKrzyzakPrincipalCurve,
     HSPrincipalCurve,
     HSConfig,
+    OptimizerConfig,
     ElasticGraphConfig,
     ElasticGraphPrincipalCurve,
     ElasticPrincipalGraphConfig,
@@ -424,7 +425,7 @@ def save_prediction_comparison_figure(
 
         handles, labels = ax.get_legend_handles_labels()
         if labels:
-            ax.legend(fontsize=8)
+            ax.legend(fontsize=12)
 
     fig.suptitle("Principal manifold regression prediction", fontsize=16)
     fig.tight_layout()
@@ -465,6 +466,12 @@ def main() -> None:
             max_segments=10,
             store_trace=True,
             trace_inner_sweeps=False,
+            optimizer=OptimizerConfig(
+                backend="torch_armijo",
+                max_gradient_steps=250,
+                torch_dtype="float64",
+                torch_device="cpu",
+            ),
         )
     ).fit(X_train)
 

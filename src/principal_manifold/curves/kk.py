@@ -5,7 +5,13 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-from .._types import CurveSnapshot, PrincipalCurveResult, copy_curve_snapshot as _copy_snapshot
+import torch
+
+from .._types import (
+    CurveSnapshot,
+    PrincipalCurveResult,
+    copy_curve_snapshot as _copy_snapshot,
+)
 from ..geometry import (
     _as_2d_float_array,
     _dataset_radius,
@@ -17,17 +23,34 @@ from ..geometry import (
 
 Array = np.ndarray
 
+
 @dataclass
 class OptimizerConfig:
+    # New default: full-curve PyTorch autograd + Armijo backtracking.
+    # The old NumPy finite-difference optimizer is still available by setting
+    # backend="numpy_finite_difference".
+    backend: str = "torch_armijo"
+
+    # These are kept for backward compatibility with the old optimizer.
     max_inner_sweeps: int = 50
     max_vertex_iterations: int = 50
     relative_vertex_tolerance: float = 1e-6
     relative_curve_tolerance: float = 1e-5
     gradient_epsilon: float = 1e-5
     directional_hessian_epsilon: float = 1e-4
+
+    # Shared line-search parameters.
     line_search_shrink: float = 0.5
     min_step_size: float = 1e-8
     armijo_c: float = 1e-4
+
+    # PyTorch backend controls.
+    # If None, the number of gradient steps is:
+    # max_inner_sweeps * max_vertex_iterations.
+    max_gradient_steps: Optional[int] = None
+    gradient_norm_tolerance: float = 1e-12
+    torch_device: str = "cpu"
+    torch_dtype: str = "float64"
 
 
 @dataclass
@@ -50,15 +73,14 @@ class _Partition:
 
 class KeglKrzyzakPrincipalCurve:
     """
-    Kégl-Krzyzak polygonal-line algorithm with the formulas written literally as in
-    the chapter / draft used in this conversation.
+    Kégl-Krzyzak polygonal-line algorithm.
 
-    Kept from the original structure:
+    Preserved from the original structure:
     - same public class name and public API
     - same config/result/trace dataclasses
     - same expectation -> optimization -> adaptation outer loop
 
-    Matched literally at formula level:
+    Formula-level behavior:
     - U(X,Y) = MSD(X,Y) + lambda/(k+1) * sum_i CP(i)
     - CP endpoint penalties are squared segment lengths
     - interior CP(i) = r^2 * (1 + cos gamma(i))
@@ -67,9 +89,9 @@ class KeglKrzyzakPrincipalCurve:
     - default lambda uses lambda' * (k / N^(1/3)) * MSD(X,Y) / r
     - partition ties go to vertices
 
-    The chapter states a gradient update y <- y - eta * grad(U_fixed) but does not
-    specify a unique eta schedule, so the implementation uses backtracking gradient
-    descent for that step while keeping the objective itself literal.
+    Main improvement:
+    - replaces per-coordinate finite-difference gradients with full-curve
+      PyTorch autograd gradient descent on the fixed-partition objective.
     """
 
     def __init__(self, config: Optional[KeglKrzyzakConfig] = None) -> None:
@@ -84,6 +106,7 @@ class KeglKrzyzakPrincipalCurve:
     def fit(self, X: Array) -> "KeglKrzyzakPrincipalCurve":
         X = _as_2d_float_array(X)
         n_samples, n_features = X.shape
+
         if n_samples < 2:
             raise ValueError("Kegl-Krzyzak principal curve requires at least two samples.")
         if n_features < 1:
@@ -100,6 +123,7 @@ class KeglKrzyzakPrincipalCurve:
             self._append_trace(X, self.vertices_, phase="init", outer_iteration=0, sweep=None)
 
         outer_iteration = 0
+
         while True:
             outer_iteration += 1
 
@@ -140,6 +164,7 @@ class KeglKrzyzakPrincipalCurve:
                 "max_vertex_move": float(diagnostics["max_vertex_move"]),
             }
             self.history_.append(record)
+
             if self.config.verbose:
                 print(record)
 
@@ -162,6 +187,7 @@ class KeglKrzyzakPrincipalCurve:
                 break
 
             self.vertices_ = self._insert_new_vertex(X, self.vertices_)
+
             if self.config.store_trace:
                 self._append_trace(
                     X,
@@ -181,6 +207,7 @@ class KeglKrzyzakPrincipalCurve:
     def result_(self) -> PrincipalCurveResult:
         if self.vertices_ is None or self._X_fit_ is None:
             raise AttributeError("Model has not been fitted yet.")
+
         projected, arc_coords, kinds, indices = self.project(self._X_fit_)
         return PrincipalCurveResult(
             vertices=self.vertices_.copy(),
@@ -230,6 +257,7 @@ class KeglKrzyzakPrincipalCurve:
             if lambda_p is not None
             else self._curvature_penalty(segments, X.shape[0], msd)
         )
+
         self.trace_.append(
             CurveSnapshot(
                 phase=phase,
@@ -248,13 +276,17 @@ class KeglKrzyzakPrincipalCurve:
         mu = X.mean(axis=0)
         centered = X - mu
         _, _, vt = np.linalg.svd(centered, full_matrices=False)
+
         pc1 = vt[0]
         pc1 = pc1 / max(np.linalg.norm(pc1), 1e-15)
+
         t = centered @ pc1
         y1 = mu + t.min() * pc1
         y2 = mu + t.max() * pc1
+
         if np.allclose(y1, y2):
             y2 = y1 + 1e-12 * np.ones_like(y1)
+
         return np.vstack([y1, y2])
 
     def _optimize_current_curve(
@@ -263,14 +295,174 @@ class KeglKrzyzakPrincipalCurve:
         vertices: Array,
         trace_callback: Optional[Callable[[Array, int, float, float], None]] = None,
     ) -> Tuple[Array, Dict[str, float]]:
+        backend = self.config.optimizer.backend.lower()
+
+        if backend in {"torch", "torch_armijo", "autograd"}:
+            return self._optimize_current_curve_torch_armijo(
+                X=X,
+                vertices=vertices,
+                trace_callback=trace_callback,
+            )
+
+        if backend in {"numpy", "finite_difference", "numpy_finite_difference"}:
+            return self._optimize_current_curve_numpy_finite_difference(
+                X=X,
+                vertices=vertices,
+                trace_callback=trace_callback,
+            )
+
+        raise ValueError(
+            "Unknown optimizer backend "
+            f"{self.config.optimizer.backend!r}. "
+            "Use 'torch_armijo' or 'numpy_finite_difference'."
+        )
+
+    def _optimize_current_curve_torch_armijo(
+        self,
+        X: Array,
+        vertices: Array,
+        trace_callback: Optional[Callable[[Array, int, float, float], None]] = None,
+    ) -> Tuple[Array, Dict[str, float]]:
+        _require_torch()
+
+        vertices_np = np.asarray(vertices, dtype=float).copy()
+        opt = self.config.optimizer
+
+        n_samples = X.shape[0]
+        n_segments = vertices_np.shape[0] - 1
+
+        # KK projection step: fixed during the gradient step.
+        partition = _partition_points(X, vertices_np)
+
+        initial_delta = _mean_squared_distance_to_polyline(X, vertices_np)
+        lambda_p = self._curvature_penalty(n_segments, n_samples, initial_delta)
+        radius = float(self._radius_ if self._radius_ is not None else 1.0)
+
+        device = torch.device(opt.torch_device)
+        dtype = _torch_dtype_from_name(opt.torch_dtype)
+
+        X_t = torch.as_tensor(X, dtype=dtype, device=device)
+        V = torch.as_tensor(vertices_np, dtype=dtype, device=device)
+
+        vertex_indices = _torch_indices(partition.vertex_indices, device)
+        segment_indices = _torch_indices(partition.segment_indices, device)
+
+        def objective(V_current: "torch.Tensor") -> "torch.Tensor":
+            return _fixed_partition_objective_torch(
+                X=X_t,
+                vertices=V_current,
+                vertex_indices=vertex_indices,
+                segment_indices=segment_indices,
+                lambda_p=lambda_p,
+                radius=radius,
+            )
+
+        prev_objective = float(objective(V).detach().cpu().item())
+        max_vertex_move_seen = 0.0
+        completed_steps = 0
+
+        max_steps = (
+            opt.max_gradient_steps
+            if opt.max_gradient_steps is not None
+            else opt.max_inner_sweeps * opt.max_vertex_iterations
+        )
+
+        for step_id in range(int(max_steps)):
+            V = V.detach().requires_grad_(True)
+            loss = objective(V)
+
+            if not torch.isfinite(loss):
+                break
+
+            grad = torch.autograd.grad(loss, V)[0]
+            grad_norm_sq_t = torch.sum(grad * grad)
+            grad_norm_sq = float(grad_norm_sq_t.detach().cpu().item())
+            grad_norm = float(np.sqrt(max(grad_norm_sq, 0.0)))
+
+            if grad_norm < opt.gradient_norm_tolerance:
+                break
+
+            old_V = V.detach()
+            old_loss = float(loss.detach().cpu().item())
+
+            step_size = 1.0
+            improved = False
+
+            with torch.no_grad():
+                while step_size >= opt.min_step_size:
+                    candidate = old_V - step_size * grad
+                    candidate_loss_t = objective(candidate)
+
+                    if not torch.isfinite(candidate_loss_t):
+                        step_size *= opt.line_search_shrink
+                        continue
+
+                    candidate_loss = float(candidate_loss_t.detach().cpu().item())
+                    armijo_rhs = old_loss - opt.armijo_c * step_size * grad_norm_sq
+
+                    if candidate_loss <= armijo_rhs:
+                        move = float(
+                            torch.max(
+                                torch.linalg.vector_norm(candidate - old_V, dim=1)
+                            )
+                            .detach()
+                            .cpu()
+                            .item()
+                        )
+                        V = candidate.detach()
+                        current_objective = candidate_loss
+                        improved = True
+                        break
+
+                    step_size *= opt.line_search_shrink
+
+            if not improved:
+                break
+
+            completed_steps = step_id + 1
+            max_vertex_move_seen = max(max_vertex_move_seen, move)
+
+            if trace_callback is not None:
+                trace_callback(
+                    V.detach().cpu().numpy(),
+                    completed_steps,
+                    current_objective,
+                    lambda_p,
+                )
+
+            rel_improvement = (
+                (prev_objective - current_objective)
+                / max(abs(prev_objective), 1e-15)
+            )
+
+            if (
+                rel_improvement < opt.relative_curve_tolerance
+                and move < opt.relative_curve_tolerance
+            ):
+                break
+
+            prev_objective = current_objective
+
+        return V.detach().cpu().numpy(), {
+            "inner_sweeps": float(completed_steps),
+            "max_vertex_move": float(max_vertex_move_seen),
+        }
+
+    def _optimize_current_curve_numpy_finite_difference(
+        self,
+        X: Array,
+        vertices: Array,
+        trace_callback: Optional[Callable[[Array, int, float, float], None]] = None,
+    ) -> Tuple[Array, Dict[str, float]]:
         vertices = np.asarray(vertices, dtype=float).copy()
         opt = self.config.optimizer
+
         n_samples = X.shape[0]
         n_segments = vertices.shape[0] - 1
 
-        # The chapter's optimisation step starts from the partition obtained in the
-        # preceding projection step and keeps it fixed while taking gradients.
+        # KK projection step: fixed during the gradient step.
         partition = _partition_points(X, vertices)
+
         initial_delta = _mean_squared_distance_to_polyline(X, vertices)
         lambda_p = self._curvature_penalty(n_segments, n_samples, initial_delta)
 
@@ -281,11 +473,13 @@ class KeglKrzyzakPrincipalCurve:
             lambda_p=lambda_p,
             radius=float(self._radius_ if self._radius_ is not None else 1.0),
         )
+
         max_vertex_move_seen = 0.0
         completed_sweeps = 0
 
         for sweep in range(opt.max_inner_sweeps):
             max_vertex_move = 0.0
+
             for i in range(vertices.shape[0]):
                 old_vertex = vertices[i].copy()
                 new_vertex = self._optimize_single_vertex(
@@ -296,7 +490,10 @@ class KeglKrzyzakPrincipalCurve:
                     lambda_p=lambda_p,
                 )
                 vertices[i] = new_vertex
-                max_vertex_move = max(max_vertex_move, float(np.linalg.norm(new_vertex - old_vertex)))
+                max_vertex_move = max(
+                    max_vertex_move,
+                    float(np.linalg.norm(new_vertex - old_vertex)),
+                )
 
             current_objective = _fixed_partition_objective(
                 X=X,
@@ -305,15 +502,24 @@ class KeglKrzyzakPrincipalCurve:
                 lambda_p=lambda_p,
                 radius=float(self._radius_ if self._radius_ is not None else 1.0),
             )
+
             completed_sweeps = sweep + 1
             max_vertex_move_seen = max(max_vertex_move_seen, max_vertex_move)
 
             if trace_callback is not None:
                 trace_callback(vertices.copy(), completed_sweeps, current_objective, lambda_p)
 
-            rel_improvement = (prev_objective - current_objective) / max(abs(prev_objective), 1e-15)
-            if rel_improvement < opt.relative_curve_tolerance and max_vertex_move < opt.relative_curve_tolerance:
+            rel_improvement = (
+                (prev_objective - current_objective)
+                / max(abs(prev_objective), 1e-15)
+            )
+
+            if (
+                rel_improvement < opt.relative_curve_tolerance
+                and max_vertex_move < opt.relative_curve_tolerance
+            ):
                 break
+
             prev_objective = current_objective
 
         return vertices, {
@@ -349,23 +555,29 @@ class KeglKrzyzakPrincipalCurve:
         for _ in range(opt.max_vertex_iterations):
             grad = _finite_difference_gradient(objective, y, opt.gradient_epsilon)
             grad_norm = float(np.linalg.norm(grad))
+
             if grad_norm < 1e-12:
                 break
 
             direction = -grad
             step = 1.0
             improved = False
+
             while step >= opt.min_step_size:
                 candidate = y + step * direction
                 f_candidate = objective(candidate)
-                if f_candidate <= f_prev - opt.armijo_c * step * (grad_norm ** 2):
+
+                if f_candidate <= f_prev - opt.armijo_c * step * (grad_norm**2):
                     rel = (f_prev - f_candidate) / max(abs(f_prev), 1e-15)
                     y = candidate
                     f_prev = f_candidate
                     improved = True
+
                     if rel < opt.relative_vertex_tolerance:
                         return y
+
                     break
+
                 step *= opt.line_search_shrink
 
             if not improved:
@@ -376,37 +588,202 @@ class KeglKrzyzakPrincipalCurve:
     def _insert_new_vertex(self, X: Array, vertices: Array) -> Array:
         partition = _partition_points(X, vertices)
         seg_counts = np.array([len(idx) for idx in partition.segment_indices], dtype=int)
+
         if seg_counts.size == 0:
             return vertices
 
         max_count = seg_counts.max()
         candidates = np.flatnonzero(seg_counts == max_count)
+
         seg_lengths = np.array(
-            [np.linalg.norm(vertices[i + 1] - vertices[i]) for i in range(vertices.shape[0] - 1)],
+            [
+                np.linalg.norm(vertices[i + 1] - vertices[i])
+                for i in range(vertices.shape[0] - 1)
+            ],
             dtype=float,
         )
+
         best_seg = int(candidates[np.argmax(seg_lengths[candidates])])
         midpoint = 0.5 * (vertices[best_seg] + vertices[best_seg + 1])
-        return np.vstack([vertices[: best_seg + 1], midpoint[None, :], vertices[best_seg + 1 :]])
+
+        return np.vstack(
+            [
+                vertices[: best_seg + 1],
+                midpoint[None, :],
+                vertices[best_seg + 1 :],
+            ]
+        )
 
     def _curvature_penalty(self, n_segments: int, n_samples: int, delta_n: float) -> float:
         radius = float(self._radius_ if self._radius_ is not None else 1.0)
+
         if radius <= 1e-15:
             radius = 1.0
-        return self.config.lambda0_p * (n_segments / max(n_samples ** (1.0 / 3.0), 1e-15)) * (delta_n / radius)
+
+        return self.config.lambda0_p * (
+            n_segments / max(n_samples ** (1.0 / 3.0), 1e-15)
+        ) * (delta_n / radius)
 
     def _segment_stop_threshold(self, n_samples: int, delta_n: float) -> float:
         radius = float(self._radius_ if self._radius_ is not None else 1.0)
+
         if delta_n <= 1e-15:
             return np.inf
+
         return self.config.beta * (n_samples ** (1.0 / 3.0)) * radius / delta_n
+
+
+def _require_torch() -> None:
+    if torch is None:
+        raise ImportError(
+            "The KK PyTorch optimizer requires PyTorch. Install it with something like "
+            "`python -m pip install torch`, or use "
+            "`OptimizerConfig(backend='numpy_finite_difference')`."
+        )
+
+
+def _torch_dtype_from_name(name: str) -> "torch.dtype":
+    _require_torch()
+
+    normalized = name.lower()
+    if normalized in {"float64", "double", "torch.float64"}:
+        return torch.float64
+    if normalized in {"float32", "single", "torch.float32"}:
+        return torch.float32
+
+    raise ValueError(
+        f"Unknown torch dtype {name!r}. Use 'float64' or 'float32'."
+    )
+
+
+def _torch_indices(index_lists: List[Array], device: "torch.device") -> List["torch.Tensor"]:
+    _require_torch()
+
+    return [
+        torch.as_tensor(idx, dtype=torch.long, device=device)
+        for idx in index_lists
+    ]
+
+
+def _segment_distance_squared_torch(
+    X: "torch.Tensor",
+    a: "torch.Tensor",
+    b: "torch.Tensor",
+    eps: float = 1e-15,
+) -> "torch.Tensor":
+    ab = b - a
+    denom = torch.sum(ab * ab).clamp_min(eps)
+
+    t = torch.sum((X - a[None, :]) * ab[None, :], dim=1) / denom
+    t = torch.clamp(t, 0.0, 1.0)
+
+    proj = a[None, :] + t[:, None] * ab[None, :]
+    return torch.sum((X - proj) ** 2, dim=1)
+
+
+def _cp_term_torch(
+    vertices: "torch.Tensor",
+    cp_index: int,
+    radius: float,
+    eps: float = 1e-15,
+) -> "torch.Tensor":
+    last = vertices.shape[0] - 1
+
+    if cp_index == 0:
+        return torch.sum((vertices[0] - vertices[1]) ** 2)
+
+    if cp_index == last:
+        return torch.sum((vertices[last - 1] - vertices[last]) ** 2)
+
+    left = vertices[cp_index - 1] - vertices[cp_index]
+    right = vertices[cp_index + 1] - vertices[cp_index]
+
+    left_norm = torch.linalg.vector_norm(left)
+    right_norm = torch.linalg.vector_norm(right)
+    norm_product = left_norm * right_norm
+
+    raw_cos = torch.dot(left, right) / norm_product.clamp_min(eps)
+    cos_gamma = torch.where(
+        norm_product <= eps,
+        torch.ones_like(raw_cos),
+        raw_cos,
+    )
+    cos_gamma = torch.clamp(cos_gamma, -1.0, 1.0)
+
+    radius_t = vertices.new_tensor(float(radius))
+    return (radius_t**2) * (1.0 + cos_gamma)
+
+
+def _penalty_sum_torch(vertices: "torch.Tensor", radius: float) -> "torch.Tensor":
+    total = vertices.new_tensor(0.0)
+
+    for i in range(vertices.shape[0]):
+        total = total + _cp_term_torch(vertices, i, radius)
+
+    return total
+
+
+def _fixed_partition_data_sum_torch(
+    X: "torch.Tensor",
+    vertices: "torch.Tensor",
+    vertex_indices: List["torch.Tensor"],
+    segment_indices: List["torch.Tensor"],
+) -> "torch.Tensor":
+    total = vertices.new_tensor(0.0)
+
+    for j, idx in enumerate(vertex_indices):
+        if idx.numel() == 0:
+            continue
+
+        pts = X.index_select(0, idx)
+        total = total + torch.sum((pts - vertices[j][None, :]) ** 2)
+
+    for j, idx in enumerate(segment_indices):
+        if idx.numel() == 0:
+            continue
+
+        pts = X.index_select(0, idx)
+        total = total + torch.sum(
+            _segment_distance_squared_torch(pts, vertices[j], vertices[j + 1])
+        )
+
+    return total
+
+
+def _fixed_partition_objective_torch(
+    X: "torch.Tensor",
+    vertices: "torch.Tensor",
+    vertex_indices: List["torch.Tensor"],
+    segment_indices: List["torch.Tensor"],
+    lambda_p: float,
+    radius: float,
+) -> "torch.Tensor":
+    n = X.shape[0]
+    k = vertices.shape[0] - 1
+
+    data_term = _fixed_partition_data_sum_torch(
+        X=X,
+        vertices=vertices,
+        vertex_indices=vertex_indices,
+        segment_indices=segment_indices,
+    ) / max(n, 1)
+
+    penalty_term = (
+        float(lambda_p) / max(k + 1, 1)
+    ) * _penalty_sum_torch(vertices, radius)
+
+    return data_term + penalty_term
 
 
 def _partition_points(X: Array, vertices: Array) -> _Partition:
     n_vertices = vertices.shape[0]
     n_segments = n_vertices - 1
 
-    vertex_d2 = np.stack([np.sum((X - v[None, :]) ** 2, axis=1) for v in vertices], axis=1)
+    vertex_d2 = np.stack(
+        [np.sum((X - v[None, :]) ** 2, axis=1) for v in vertices],
+        axis=1,
+    )
+
     segment_d2_cols: List[Array] = []
     for i in range(n_segments):
         d2, _, _ = _segment_distance_squared(X, vertices[i], vertices[i + 1])
@@ -414,15 +791,24 @@ def _partition_points(X: Array, vertices: Array) -> _Partition:
 
     if segment_d2_cols:
         segment_d2 = np.stack(segment_d2_cols, axis=1)
+
         # Vertices are concatenated before segments, so exact ties go to vertices.
         all_d2 = np.concatenate([vertex_d2, segment_d2], axis=1)
     else:
         all_d2 = vertex_d2
 
     labels = np.argmin(all_d2, axis=1)
+
     vertex_indices = [np.flatnonzero(labels == i) for i in range(n_vertices)]
-    segment_indices = [np.flatnonzero(labels == (n_vertices + i)) for i in range(n_segments)]
-    return _Partition(vertex_indices=vertex_indices, segment_indices=segment_indices, point_labels=labels)
+    segment_indices = [
+        np.flatnonzero(labels == (n_vertices + i)) for i in range(n_segments)
+    ]
+
+    return _Partition(
+        vertex_indices=vertex_indices,
+        segment_indices=segment_indices,
+        point_labels=labels,
+    )
 
 
 def _cos_gamma(vertices: Array, idx: int) -> float:
@@ -431,8 +817,10 @@ def _cos_gamma(vertices: Array, idx: int) -> float:
 
     left = vertices[idx - 1] - vertices[idx]
     right = vertices[idx + 1] - vertices[idx]
+
     nl = float(np.linalg.norm(left))
     nr = float(np.linalg.norm(right))
+
     if nl <= 1e-15 or nr <= 1e-15:
         return 1.0
 
@@ -442,15 +830,21 @@ def _cos_gamma(vertices: Array, idx: int) -> float:
 
 def _cp_term(vertices: Array, cp_index: int, radius: float) -> float:
     last = vertices.shape[0] - 1
+
     if cp_index == 0:
         return float(np.sum((vertices[0] - vertices[1]) ** 2))
+
     if cp_index == last:
         return float(np.sum((vertices[last - 1] - vertices[last]) ** 2))
-    return float((radius ** 2) * (1.0 + _cos_gamma(vertices, cp_index)))
+
+    return float((radius**2) * (1.0 + _cos_gamma(vertices, cp_index)))
 
 
 def _all_cp_terms(vertices: Array, radius: float) -> Array:
-    return np.array([_cp_term(vertices, i, radius) for i in range(vertices.shape[0])], dtype=float)
+    return np.array(
+        [_cp_term(vertices, i, radius) for i in range(vertices.shape[0])],
+        dtype=float,
+    )
 
 
 def _penalty_sum(vertices: Array, radius: float) -> float:
@@ -459,13 +853,16 @@ def _penalty_sum(vertices: Array, radius: float) -> float:
 
 def _fixed_partition_data_sum(X: Array, vertices: Array, partition: _Partition) -> float:
     total = 0.0
+
     for j, idx in enumerate(partition.vertex_indices):
         if idx.size:
             total += float(np.sum((X[idx] - vertices[j][None, :]) ** 2))
+
     for j, idx in enumerate(partition.segment_indices):
         if idx.size:
             d2, _, _ = _segment_distance_squared(X[idx], vertices[j], vertices[j + 1])
             total += float(np.sum(d2))
+
     return total
 
 
@@ -478,8 +875,10 @@ def _fixed_partition_objective(
 ) -> float:
     n = X.shape[0]
     k = vertices.shape[0] - 1
+
     data_term = _fixed_partition_data_sum(X, vertices, partition) / max(n, 1)
     penalty_term = (lambda_p / max(k + 1, 1)) * _penalty_sum(vertices, radius)
+
     return float(data_term + penalty_term)
 
 
@@ -497,6 +896,7 @@ def _local_data_sum_exact(
 ) -> float:
     vv = np.asarray(vertices, dtype=float).copy()
     vv[vertex_index] = np.asarray(y, dtype=float)
+
     k = vv.shape[0] - 1
     total = 0.0
 
@@ -507,21 +907,35 @@ def _local_data_sum_exact(
     if vertex_index > 0:
         s_idx = partition.segment_indices[vertex_index - 1]
         if s_idx.size:
-            d2, _, _ = _segment_distance_squared(X[s_idx], vv[vertex_index - 1], vv[vertex_index])
+            d2, _, _ = _segment_distance_squared(
+                X[s_idx],
+                vv[vertex_index - 1],
+                vv[vertex_index],
+            )
             total += float(np.sum(d2))
 
     if vertex_index < k:
         s_idx = partition.segment_indices[vertex_index]
         if s_idx.size:
-            d2, _, _ = _segment_distance_squared(X[s_idx], vv[vertex_index], vv[vertex_index + 1])
+            d2, _, _ = _segment_distance_squared(
+                X[s_idx],
+                vv[vertex_index],
+                vv[vertex_index + 1],
+            )
             total += float(np.sum(d2))
 
     return total
 
 
-def _local_penalty_sum_exact(vertices: Array, vertex_index: int, y: Array, radius: float) -> float:
+def _local_penalty_sum_exact(
+    vertices: Array,
+    vertex_index: int,
+    y: Array,
+    radius: float,
+) -> float:
     vv = np.asarray(vertices, dtype=float).copy()
     vv[vertex_index] = np.asarray(y, dtype=float)
+
     affected = _affected_cp_indices(vertex_index, vv.shape[0])
     return float(sum(_cp_term(vv, idx, radius) for idx in affected))
 
@@ -537,23 +951,42 @@ def _local_vertex_objective_exact(
 ) -> float:
     n = X.shape[0]
     k = vertices.shape[0] - 1
-    data_term = _local_data_sum_exact(X, vertices, partition, vertex_index, y) / max(n, 1)
-    penalty_term = (lambda_p / max(k + 1, 1)) * _local_penalty_sum_exact(vertices, vertex_index, y, radius)
+
+    data_term = _local_data_sum_exact(
+        X,
+        vertices,
+        partition,
+        vertex_index,
+        y,
+    ) / max(n, 1)
+
+    penalty_term = (
+        lambda_p / max(k + 1, 1)
+    ) * _local_penalty_sum_exact(vertices, vertex_index, y, radius)
+
     return float(data_term + penalty_term)
 
 
 def _finite_difference_gradient(func, y: Array, eps: float) -> Array:
     grad = np.zeros_like(y)
     scale = eps * (1.0 + np.linalg.norm(y))
+
     for j in range(y.shape[0]):
         step = np.zeros_like(y)
         step[j] = scale
+
         f_plus = func(y + step)
         f_minus = func(y - step)
+
         grad[j] = (f_plus - f_minus) / (2.0 * scale)
+
     return grad
 
 
 def _directional_curvature(func, y: Array, direction: Array, eps: float) -> float:
     h = eps * (1.0 + np.linalg.norm(y))
     f0 = func(y)
+    f_plus = func(y + h * direction)
+    f_minus = func(y - h * direction)
+
+    return float((f_plus - 2.0 * f0 + f_minus) / (h**2))

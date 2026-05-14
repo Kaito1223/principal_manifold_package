@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 from matplotlib.collections import LineCollection
 from mpl_toolkits.mplot3d.art3d import Line3DCollection
+from matplotlib.lines import Line2D
 
 from ._utils import (
     _as_float_matrix,
@@ -51,17 +52,17 @@ def plot_principal_object(
 
     if ax is None:
         if resolved_dim == 3:
-            fig = plt.figure(figsize=(7, 5))
+            fig = plt.figure(figsize=(10, 7))
             ax = fig.add_subplot(111, projection="3d")
         else:
-            _, ax = plt.subplots(figsize=(7, 5))
+            _, ax = plt.subplots(figsize=(10, 7))
 
     if resolved_dim == 2:
         ax.scatter(Xp[:, 0], Xp[:, 1], s=24, alpha=0.65, label="data")
 
         if show_structure_segments and len(edges) > 0:
             segments = np.stack([Vp[edges[:, 0]], Vp[edges[:, 1]]], axis=1)
-            line_collection = LineCollection(segments, linewidths=2, alpha=0.95)
+            line_collection = LineCollection(segments, linewidths=2, alpha=0.95, colors="black",)
             ax.add_collection(line_collection)
 
         if show_structure_vertices and len(Vp) > 0:
@@ -83,14 +84,14 @@ def plot_principal_object(
 
         ax.autoscale()
         ax.set_aspect("equal", adjustable="box")
-        ax.set_xlabel("x1")
-        ax.set_ylabel("x2")
+        ax.set_xlabel("x1", fontsize = 15)
+        ax.set_ylabel("x2", fontsize = 15)
     else:
         ax.scatter(Xp[:, 0], Xp[:, 1], Xp[:, 2], s=20, alpha=0.55, label="data")
 
         if show_structure_segments and len(edges) > 0:
             segments = np.stack([Vp[edges[:, 0]], Vp[edges[:, 1]]], axis=1)
-            line_collection = Line3DCollection(segments, linewidths=2, alpha=0.95)
+            line_collection = Line3DCollection(segments, linewidths=2, alpha=0.95, colors="black",)
             ax.add_collection(line_collection)
 
         if show_structure_vertices and len(Vp) > 0:
@@ -105,12 +106,12 @@ def plot_principal_object(
         ax.set_xlim(mins[0], maxs[0])
         ax.set_ylim(mins[1], maxs[1])
         ax.set_zlim(mins[2], maxs[2])
-        ax.set_xlabel("x1")
-        ax.set_ylabel("x2")
-        ax.set_zlabel("x3")
+        ax.set_xlabel("x1", fontsize = 15)
+        ax.set_ylabel("x2", fontsize = 15)
+        ax.set_zlabel("x3", fontsize = 15)
 
     if title is not None:
-        ax.set_title(title)
+        ax.set_title(title, fontsize = 17)
 
     handles, labels = ax.get_legend_handles_labels()
     filtered = [(h, l) for h, l in zip(handles, labels) if l and not l.startswith("_")]

@@ -17,6 +17,14 @@ from .elastic import (
     ElasticGraphFramework,
 )
 
+from .metrics import (
+    prediction_rmse,
+    prediction_sad,
+    prediction_mae,
+    geometric_sad,
+    geometric_mad,
+)
+
 __all__ = [
     "CurveSnapshot",
     "PrincipalCurveResult",
@@ -42,4 +50,9 @@ __all__ = [
     "ElasticGraphFramework",
     "PrincipalManifoldRegressor",
     "RegressionPredictionResult",
+    "prediction_rmse",
+    "prediction_sad",
+    "prediction_mae",
+    "geometric_sad",
+    "geometric_mad",
 ]
