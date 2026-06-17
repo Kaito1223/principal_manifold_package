@@ -49,3 +49,14 @@ src/principal_manifold/
     ├── tree.py
     └── comparison.py
 ```
+
+## Demo scripts
+
+Runnable smoke/demo scripts live in `tests/`.
+
+- `uv run python tests/curve_evolution_demo.py` -> `tests/demo_2d_outputs/`
+- `uv run python tests/curve_evolution_demo_3d.py` -> `tests/demo_3d_outputs/`
+- `uv run python tests/surface_evolution_demo.py` -> `tests/demo_surface_outputs/`
+- `uv run python tests/intrinsic_k_demo.py` -> `tests/demo_intrinsic_k_outputs/`
+
+Each demo writes `summary.json` plus generated figures/animations.

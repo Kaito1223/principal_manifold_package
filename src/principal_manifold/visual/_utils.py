@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Optional, Tuple
+from typing import Mapping, Optional, Tuple
 
 import numpy as np
 
@@ -30,6 +30,60 @@ def _normalize_method_name(method_name: str) -> str:
             "method_name must be one of: 'HS', 'KK', 'ELASTIC_MAP', 'PRINCIPAL_ELASTIC_GRAPH'."
         )
     return normalized
+
+
+def _normalize_render_mode(render_mode: str) -> str:
+    normalized = str(render_mode).strip().upper().replace("-", "_").replace(" ", "_")
+    aliases = {
+        "LINE": "CURVE",
+        "POLYLINE": "CURVE",
+        "MESH": "SURFACE",
+        "MANIFOLD": "INTRINSIC",
+    }
+    normalized = aliases.get(normalized, normalized)
+    allowed = {"CURVE", "GRAPH", "SURFACE", "INTRINSIC"}
+    if normalized not in allowed:
+        raise ValueError(
+            "render_mode must be one of: 'curve', 'graph', 'surface', 'intrinsic'."
+        )
+    return normalized
+
+
+def _infer_render_mode(
+    render_mode: Optional[str] = None,
+    method_name: Optional[str] = None,
+    snapshot=None,
+    edges: Optional[Array] = None,
+    faces: Optional[Array] = None,
+    cells_by_dim: Optional[Mapping[int, Array]] = None,
+) -> str:
+    if render_mode is not None:
+        return _normalize_render_mode(render_mode)
+
+    if cells_by_dim is None and snapshot is not None and hasattr(snapshot, "cells_by_dim"):
+        cells_by_dim = snapshot.cells_by_dim
+    if cells_by_dim:
+        return "INTRINSIC"
+
+    if faces is None and snapshot is not None and hasattr(snapshot, "faces"):
+        faces = snapshot.faces
+    if faces is not None and np.asarray(faces, dtype=int).size > 0:
+        return "SURFACE"
+
+    if edges is None and snapshot is not None and hasattr(snapshot, "edges"):
+        snapshot_edges = snapshot.edges
+        if snapshot_edges is not None:
+            edges = np.asarray(snapshot_edges, dtype=int)
+    if edges is not None and np.asarray(edges, dtype=int).size > 0:
+        return "GRAPH"
+
+    if method_name is None:
+        return "CURVE"
+
+    method = _normalize_method_name(method_name)
+    if method in {"HS", "KK"}:
+        return "CURVE"
+    return "GRAPH"
 
 
 def _supported_plot_dimension(X: Array, vertices: Array, target_dim: Optional[int]) -> Optional[int]:
@@ -175,9 +229,28 @@ def _visual_options_for_method(method_name: str, show_projections: bool):
             "show_structure_vertices": False,
         }
 
+    return _visual_options_for_render_mode("graph", show_projections, method_name=method)
+
+
+def _visual_options_for_render_mode(
+    render_mode: str,
+    show_projections: bool,
+    method_name: Optional[str] = None,
+):
+    resolved_mode = _normalize_render_mode(render_mode)
+
+    if method_name is not None and _normalize_method_name(method_name) == "HS":
+        return {
+            "need_projection": True,
+            "show_projections": True,
+            "show_projected_points": False,
+            "show_structure_segments": True,
+            "show_structure_vertices": False,
+        }
+
     return {
-        "need_projection": bool(show_projections),
-        "show_projections": bool(show_projections),
+        "need_projection": bool(show_projections) and resolved_mode in {"CURVE", "GRAPH"},
+        "show_projections": bool(show_projections) and resolved_mode in {"CURVE", "GRAPH"},
         "show_projected_points": False,
         "show_structure_segments": True,
         "show_structure_vertices": True,

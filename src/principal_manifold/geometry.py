@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 
@@ -32,6 +32,15 @@ def _pca_init_line(X: Array) -> Tuple[Array, Array, Array]:
     direction = direction / max(np.linalg.norm(direction), 1e-15)
     lam = centered @ direction
     return mean, direction, lam
+
+
+def _orient_pc_component(component: Array, scores: Array) -> Tuple[Array, Array]:
+    component = np.asarray(component, dtype=float)
+    scores = np.asarray(scores, dtype=float)
+    anchor = int(np.argmax(np.abs(component)))
+    if component[anchor] < 0.0:
+        return -component, -scores
+    return component, scores
 
 
 def _sort_nodes_by_lambda(lam: Array, vertices: Array) -> Tuple[Array, Array]:
@@ -161,6 +170,42 @@ def _initialize_nodes_on_first_pc(X: Array, n_nodes: int) -> Array:
     return mean[None, :] + grid[:, None] * direction[None, :]
 
 
+def _initialize_intrinsic_coordinates_on_first_k_pcs(X: Array, k: int) -> Array:
+    X = _as_2d_float_array(X)
+    if k < 1:
+        raise ValueError("k must be at least 1.")
+    if k > X.shape[1]:
+        raise ValueError(f"k must be <= n_features ({X.shape[1]}).")
+
+    mean = X.mean(axis=0)
+    centered = X - mean
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    basis = np.asarray(vt[:k], dtype=float).copy()
+    scores = centered @ basis.T
+
+    for idx in range(k):
+        basis[idx], scores[:, idx] = _orient_pc_component(basis[idx], scores[:, idx])
+
+    return scores
+
+
+def _initialize_surface_grid_on_first_two_pcs(X: Array, n_u: int, n_v: int) -> Array:
+    X = _as_2d_float_array(X)
+    if X.shape[1] < 2:
+        raise ValueError("ElasticSurfacePrincipalManifold requires at least 2 features.")
+    mean = X.mean(axis=0)
+    centered = X - mean
+    _, _, vt = np.linalg.svd(centered, full_matrices=False)
+    basis = vt[: min(2, vt.shape[0])]
+    basis = basis / np.maximum(np.linalg.norm(basis, axis=1, keepdims=True), 1e-15)
+    scores = centered @ basis.T
+    u_grid = np.linspace(scores[:, 0].min(), scores[:, 0].max(), int(n_u))
+    v_grid = np.linspace(scores[:, 1].min(), scores[:, 1].max(), int(n_v))
+    uu, vv = np.meshgrid(u_grid, v_grid, indexing="ij")
+    offsets = uu[..., None] * basis[0][None, None, :] + vv[..., None] * basis[1][None, None, :]
+    return (mean[None, None, :] + offsets).reshape(-1, X.shape[1])
+
+
 def _assign_points_to_nodes(X: Array, vertices: Array) -> Array:
     return np.argmin(_squared_distances(X, vertices), axis=1)
 
@@ -177,22 +222,113 @@ def _graph_total_edge_length(vertices: Array, edge_index_pairs: Sequence[Tuple[i
     return float(sum(np.linalg.norm(vertices[i] - vertices[j]) for i, j in edge_index_pairs))
 
 
-def _project_onto_graph_edges(X: Array, vertices: Array, edge_index_pairs: Sequence[Tuple[int, int]]) -> Array:
+def _project_onto_complex(
+    X: Array,
+    vertices: Array,
+    edge_index_pairs: Optional[Sequence[Tuple[int, int]]] = None,
+    faces: Optional[Array] = None,
+    prefer_dim: Optional[int] = None,
+) -> Array:
     X = _as_2d_float_array(X)
-    if len(edge_index_pairs) == 0:
-        nearest = _assign_points_to_nodes(X, vertices)
-        return vertices[nearest]
-    best_d2 = np.full(X.shape[0], np.inf, dtype=float)
-    best_proj = np.zeros_like(X)
-    for i, j in edge_index_pairs:
-        d2, proj, _ = _segment_distance_squared(X, vertices[i], vertices[j])
-        mask = d2 < best_d2
-        best_d2[mask] = d2[mask]
-        best_proj[mask] = proj[mask]
-    return best_proj
+    vertices = _as_2d_float_array(vertices)
+
+    edge_pairs: Sequence[Tuple[int, int]] = [] if edge_index_pairs is None else edge_index_pairs
+    face_array = np.empty((0, 3), dtype=int) if faces is None else np.asarray(faces, dtype=int)
+
+    use_faces = (prefer_dim == 2) or (prefer_dim is None and face_array.size > 0)
+    use_edges = (prefer_dim == 1) or (prefer_dim is None and len(edge_pairs) > 0)
+
+    if use_faces and face_array.size > 0:
+        best_d2 = np.full(X.shape[0], np.inf, dtype=float)
+        best_proj = np.zeros_like(X)
+        for i, j, k in face_array:
+            d2, proj = _triangle_distance_squared(X, vertices[i], vertices[j], vertices[k])
+            mask = d2 < best_d2
+            best_d2[mask] = d2[mask]
+            best_proj[mask] = proj[mask]
+        return best_proj
+
+    if use_edges and len(edge_pairs) > 0:
+        best_d2 = np.full(X.shape[0], np.inf, dtype=float)
+        best_proj = np.zeros_like(X)
+        for i, j in edge_pairs:
+            d2, proj, _ = _segment_distance_squared(X, vertices[i], vertices[j])
+            mask = d2 < best_d2
+            best_d2[mask] = d2[mask]
+            best_proj[mask] = proj[mask]
+        return best_proj
+
+    nearest = _assign_points_to_nodes(X, vertices)
+    return vertices[nearest]
+
+
+def _project_onto_graph_edges(X: Array, vertices: Array, edge_index_pairs: Sequence[Tuple[int, int]]) -> Array:
+    return _project_onto_complex(
+        X=X,
+        vertices=vertices,
+        edge_index_pairs=edge_index_pairs,
+        prefer_dim=1,
+    )
 
 
 
 def _mean_squared_distance_to_graph(X: Array, vertices: Array, edges: Sequence[Tuple[int, int]]) -> float:
     projected = _project_onto_graph_edges(X, vertices, edges)
+    return float(np.mean(np.sum((X - projected) ** 2, axis=1)))
+
+
+def _triangle_distance_squared(points: Array, a: Array, b: Array, c: Array) -> Tuple[Array, Array]:
+    points = _as_2d_float_array(points)
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    c = np.asarray(c, dtype=float)
+
+    ab = b - a
+    ac = c - a
+    gram = np.array(
+        [
+            [float(np.dot(ab, ab)), float(np.dot(ab, ac))],
+            [float(np.dot(ab, ac)), float(np.dot(ac, ac))],
+        ],
+        dtype=float,
+    )
+    rhs = np.column_stack([(points - a[None, :]) @ ab, (points - a[None, :]) @ ac])
+    if abs(np.linalg.det(gram)) > 1e-15:
+        weights = np.linalg.solve(gram, rhs.T).T
+        u = weights[:, 0]
+        v = weights[:, 1]
+        inside = (u >= 0.0) & (v >= 0.0) & ((u + v) <= 1.0)
+        plane_projection = a[None, :] + u[:, None] * ab[None, :] + v[:, None] * ac[None, :]
+    else:
+        inside = np.zeros(points.shape[0], dtype=bool)
+        plane_projection = np.repeat(a[None, :], points.shape[0], axis=0)
+
+    best_d2 = np.full(points.shape[0], np.inf, dtype=float)
+    best_proj = np.zeros_like(points)
+
+    if np.any(inside):
+        inside_d2 = np.sum((points[inside] - plane_projection[inside]) ** 2, axis=1)
+        best_d2[inside] = inside_d2
+        best_proj[inside] = plane_projection[inside]
+
+    for p0, p1 in ((a, b), (b, c), (c, a)):
+        edge_d2, edge_proj, _ = _segment_distance_squared(points, p0, p1)
+        mask = edge_d2 < best_d2
+        best_d2[mask] = edge_d2[mask]
+        best_proj[mask] = edge_proj[mask]
+
+    return best_d2, best_proj
+
+
+def _project_onto_surface(X: Array, vertices: Array, faces: Array) -> Array:
+    return _project_onto_complex(
+        X=X,
+        vertices=vertices,
+        faces=faces,
+        prefer_dim=2,
+    )
+
+
+def _mean_squared_distance_to_surface(X: Array, vertices: Array, faces: Array) -> float:
+    projected = _project_onto_surface(X, vertices, faces)
     return float(np.mean(np.sum((X - projected) ** 2, axis=1)))

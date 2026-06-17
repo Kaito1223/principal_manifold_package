@@ -9,6 +9,8 @@ from principal_manifold import (
     ElasticGraphPrincipalCurve,
     ElasticPrincipalGraphConfig,
     ElasticPrincipalGraph,
+    ElasticSurfaceConfig,
+    ElasticSurfacePrincipalManifold,
 )
 
 
@@ -17,6 +19,7 @@ def test_public_imports():
     assert KeglKrzyzakPrincipalCurve is not None
     assert ElasticGraphPrincipalCurve is not None
     assert ElasticPrincipalGraph is not None
+    assert ElasticSurfacePrincipalManifold is not None
 
 
 def test_hs_smoke_fit():

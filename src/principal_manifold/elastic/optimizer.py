@@ -9,10 +9,18 @@ from ..geometry import (
     _as_2d_float_array,
     _assign_points_to_nodes,
     _graph_total_edge_length,
+    _project_onto_complex,
     _project_onto_graph_edges,
 )
 
 Array = np.ndarray
+
+
+@dataclass(frozen=True)
+class ElasticEnergyTerms:
+    data_term: float
+    elastic_term: float
+    total: float
 
 @dataclass(frozen=True)
 class Edge:
@@ -83,6 +91,7 @@ class FixedElasticGraphOptimizer:
         history: List[Dict[str, object]] = []
         prev_energy: Optional[float] = None
         converged = False
+        sweep = 0
 
         for sweep in range(1, self.max_iter + 1):
             assignment = _assign_points_to_nodes(X, Y)
@@ -95,7 +104,7 @@ class FixedElasticGraphOptimizer:
                 sample_weight=w,
             )
             updated_assignment = _assign_points_to_nodes(X, updated)
-            energy = _elastic_energy_from_node_assignments_weighted(
+            energy_terms = _elastic_energy_terms_from_node_assignments_weighted(
                 X=X,
                 vertices=updated,
                 assignment=updated_assignment,
@@ -103,6 +112,7 @@ class FixedElasticGraphOptimizer:
                 stars=filtered_stars,
                 sample_weight=w,
             )
+            energy = energy_terms.total
 
             if return_history:
                 node_msd = _node_mean_squared_distance_weighted(X, updated, updated_assignment, w)
@@ -121,6 +131,9 @@ class FixedElasticGraphOptimizer:
                         "mean_squared_distance": float(edge_msd),
                         "polyline_length": float(_graph_total_edge_length(updated, [(e.i, e.j) for e in edges])),
                         "elastic_energy": float(energy),
+                        "data_term": float(energy_terms.data_term),
+                        "elastic_term": float(energy_terms.elastic_term),
+                        "total": float(energy_terms.total),
                     }
                 )
 
@@ -133,7 +146,7 @@ class FixedElasticGraphOptimizer:
             prev_energy = energy
 
         final_assignment = _assign_points_to_nodes(X, Y)
-        final_energy = _elastic_energy_from_node_assignments_weighted(
+        final_energy_terms = _elastic_energy_terms_from_node_assignments_weighted(
             X=X,
             vertices=Y,
             assignment=final_assignment,
@@ -141,6 +154,7 @@ class FixedElasticGraphOptimizer:
             stars=filtered_stars,
             sample_weight=w,
         )
+        final_energy = final_energy_terms.total
         node_weights = np.bincount(final_assignment, weights=w, minlength=Y.shape[0]).astype(float)
         result = FixedElasticGraphResult(
             vertices=Y,
@@ -289,6 +303,24 @@ def _elastic_energy_from_node_assignments_weighted(
     stars: List[Star],
     sample_weight: Array,
 ) -> float:
+    return _elastic_energy_terms_from_node_assignments_weighted(
+        X=X,
+        vertices=vertices,
+        assignment=assignment,
+        edges=edges,
+        stars=stars,
+        sample_weight=sample_weight,
+    ).total
+
+
+def _elastic_energy_terms_from_node_assignments_weighted(
+    X: Array,
+    vertices: Array,
+    assignment: Array,
+    edges: List[Edge],
+    stars: List[Star],
+    sample_weight: Array,
+) -> ElasticEnergyTerms:
     w = np.asarray(sample_weight, dtype=float)
     total_weight = float(np.sum(w))
     if total_weight <= 0:
@@ -298,7 +330,15 @@ def _elastic_energy_from_node_assignments_weighted(
     penalty = 0.0
     for d in range(vertices.shape[1]):
         penalty += float(vertices[:, d].T @ P @ vertices[:, d])
-    return float(msd + penalty)
+    total = float(msd + penalty)
+    terms = ElasticEnergyTerms(
+        data_term=float(msd),
+        elastic_term=float(penalty),
+        total=total,
+    )
+    if not np.isfinite(terms.data_term) or not np.isfinite(terms.elastic_term) or not np.isfinite(terms.total):
+        raise ValueError("Elastic energy terms must be finite.")
+    return terms
 
 
 def _node_mean_squared_distance_weighted(X: Array, vertices: Array, assignment: Array, sample_weight: Array) -> float:
@@ -317,6 +357,10 @@ def _mean_squared_distance_to_graph_weighted(
     total_weight = float(np.sum(w))
     if total_weight <= 0:
         raise ValueError("sum of sample_weight must be positive.")
-    projected = _project_onto_graph_edges(X, vertices, edge_index_pairs)
+    projected = _project_onto_complex(
+        X,
+        vertices,
+        edge_index_pairs=edge_index_pairs,
+        prefer_dim=1,
+    )
     return float(np.sum(w * np.sum((X - projected) ** 2, axis=1)) / total_weight)
-

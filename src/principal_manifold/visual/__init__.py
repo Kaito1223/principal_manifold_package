@@ -2,6 +2,8 @@ from .plotting import (
     plot_principal_object,
     plot_curve_snapshot,
     plot_curve_trace_grid,
+    plot_snapshot,
+    plot_trace_grid,
     plot_curve_snapshot_2d,
     plot_curve_trace_grid_2d,
 )
@@ -23,6 +25,8 @@ __all__ = [
     "plot_principal_object",
     "plot_curve_snapshot",
     "plot_curve_trace_grid",
+    "plot_snapshot",
+    "plot_trace_grid",
     "plot_curve_snapshot_2d",
     "plot_curve_trace_grid_2d",
     "animate_curve_trace",

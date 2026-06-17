@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, cast
 
 import numpy as np
 
@@ -12,6 +12,7 @@ from ..geometry import (
     _graph_total_edge_length,
     _initialize_nodes_on_first_pc,
     _mean_squared_distance_to_graph,
+    _project_onto_complex,
     _project_onto_graph_edges,
 )
 from .grammar import (
@@ -25,10 +26,12 @@ from .grammar import (
 from .optimizer import (
     Edge,
     Star,
+    FixedElasticGraphResult,
     FixedElasticGraphOptimizer,
     _penalty_matrix,
     _validate_allowed_k_stars,
 )
+from .intrinsic_topology import IntrinsicTopologyAdapter
 from .primitive import PrimitiveElasticGraph
 
 Array = np.ndarray
@@ -85,6 +88,10 @@ class ElasticPrincipalGraphConfig:
     verbose: bool = False
     store_trace: bool = False
     allowed_k_stars: Optional[Tuple[int, ...]] = None
+    intrinsic_topology_enabled: bool = False
+    intrinsic_topology_ops: Optional[Tuple[str, ...]] = None
+    intrinsic_topology_max_ops_per_epoch: int = 1
+    intrinsic_use_projection_score: bool = True
 
 
 class ElasticPrincipalGraph:
@@ -116,6 +123,15 @@ class ElasticPrincipalGraph:
         self._grammar_sequence_: Tuple[Tuple[str, ...], ...] = _resolved_grammar_sequence(self.config)
         self._sc_max_: float = _resolved_sc_max(self.config)
         self._cc_max_: int = _resolved_cc_max(self.config, self._grammar_sequence_)
+        self._intrinsic_topology_adapter: Optional[IntrinsicTopologyAdapter] = None
+        if self.config.intrinsic_topology_enabled:
+            ops = self.config.intrinsic_topology_ops
+            if ops is None:
+                ops = ("split", "prune")
+            self._intrinsic_topology_adapter = IntrinsicTopologyAdapter(
+                ops=tuple(ops),
+                max_ops_per_epoch=int(self.config.intrinsic_topology_max_ops_per_epoch),
+            )
 
     def fit(self, X: Array) -> "ElasticPrincipalGraph":
         X = _as_2d_float_array(X)
@@ -153,8 +169,9 @@ class ElasticPrincipalGraph:
         while self._construction_complexity_ < self._cc_max_:
             any_update = False
             outer_iteration = self._construction_complexity_ + 1
+            accepted_ops_this_epoch = 0
 
-            for grammar in self._grammar_sequence_:
+            for grammar in self._resolved_epoch_grammar_sequence(outer_iteration):
                 candidates = self._apply_grammar_all_ways(self.graph_, grammar)
                 permissible = [g for g in candidates if self._structural_complexity(g) <= self._sc_max_]
                 if not permissible:
@@ -198,6 +215,10 @@ class ElasticPrincipalGraph:
                     )
 
                 any_update = True
+                accepted_ops_this_epoch += 1
+                if self._intrinsic_topology_adapter is not None:
+                    if accepted_ops_this_epoch >= self._intrinsic_topology_adapter.max_ops_per_epoch:
+                        break
                 if self._construction_complexity_ >= self._cc_max_:
                     break
 
@@ -226,7 +247,12 @@ class ElasticPrincipalGraph:
         if self.graph_ is None:
             raise ValueError("Call fit before project.")
         X = _as_2d_float_array(X)
-        return _project_onto_graph_edges(X, self.graph_.vertices, self.graph_.edges)
+        return _project_onto_complex(
+            X,
+            self.graph_.vertices,
+            edge_index_pairs=self.graph_.edges,
+            prefer_dim=1,
+        )
 
     def transform(self, X: Array) -> Array:
         return self.project(X)
@@ -239,6 +265,11 @@ class ElasticPrincipalGraph:
             raise ValueError("Call fit before score.")
         X = _as_2d_float_array(X)
         return -_mean_squared_distance_to_graph(X, self.graph_.vertices, self.graph_.edges)
+
+    def _selection_objective(self, X: Array, graph: PrimitiveElasticGraph) -> float:
+        if self._intrinsic_topology_adapter is None or not self.config.intrinsic_use_projection_score:
+            return self._objective(X, graph)
+        return self._projection_objective(X, graph)
 
     def _apply_grammar_all_ways(
         self,
@@ -279,6 +310,15 @@ class ElasticPrincipalGraph:
             return float(n_vertices) if n_branch_nodes <= self.config.bmax else np.inf
         raise ValueError(f"Unsupported structural complexity: {self.config.sc_measure}")
 
+    def _resolved_epoch_grammar_sequence(self, outer_iteration: int) -> Tuple[Tuple[str, ...], ...]:
+        if self._intrinsic_topology_adapter is None:
+            return self._grammar_sequence_
+        epoch_ops = self._intrinsic_topology_adapter.select_epoch_ops(max(0, int(outer_iteration) - 1))
+        return tuple(
+            self._intrinsic_topology_adapter.expand_to_legacy_grammar(op)
+            for op in epoch_ops
+        )
+
     def _optimize_graph(
         self,
         X: Array,
@@ -292,23 +332,32 @@ class ElasticPrincipalGraph:
         local_trace: List[GraphSnapshot] = []
 
         for epoch_idx, multiplier in enumerate(self.config.softening, start=1):
-            result, opt_history = self._optimizer.optimize(
-                X=X,
-                vertices=current_vertices,
-                edges=graph.edge_objects(multiplier=float(multiplier)),
-                stars=graph.star_objects(multiplier=float(multiplier), allowed_k_stars=self.config.allowed_k_stars),
-                sample_weight=None,
-                return_history=True,
-                allowed_k_stars=self.config.allowed_k_stars,
+            result, opt_history = cast(
+                Tuple[FixedElasticGraphResult, List[Dict[str, object]]],
+                self._optimizer.optimize(
+                    X=X,
+                    vertices=current_vertices,
+                    edges=graph.edge_objects(multiplier=float(multiplier)),
+                    stars=graph.star_objects(multiplier=float(multiplier), allowed_k_stars=self.config.allowed_k_stars),
+                    sample_weight=None,
+                    return_history=True,
+                    allowed_k_stars=self.config.allowed_k_stars,
+                ),
             )
             current_vertices = np.asarray(result.vertices, dtype=float).copy()
 
             for item in opt_history:
-                msd = float(item["mean_squared_distance"])
+                item_dict = cast(Dict[str, Any], item)
+                msd = float(item_dict["mean_squared_distance"])
+                sweep = int(item_dict["sweep"])
+                node_msd = float(item_dict["node_mean_squared_distance"])
+                polyline_length = float(item_dict["polyline_length"])
+                elastic_energy = float(item_dict["elastic_energy"])
+                sweep_vertices = np.asarray(item_dict["vertices"], dtype=float).copy()
                 record = {
                     "outer_iteration": float(outer_iteration),
                     "epoch": float(epoch_idx),
-                    "sweep": float(item["sweep"]),
+                    "sweep": float(sweep),
                     "operation": "" if operation is None else str(operation),
                     "construction_complexity": float(construction_complexity),
                     "structural_complexity": float(self._structural_complexity(graph)),
@@ -317,9 +366,9 @@ class ElasticPrincipalGraph:
                     "segments": float(len(graph.edges)),
                     "mean_squared_distance": msd,
                     "root_mean_squared_distance": float(np.sqrt(max(msd, 0.0))),
-                    "node_mean_squared_distance": float(item["node_mean_squared_distance"]),
-                    "polyline_length": float(item["polyline_length"]),
-                    "elastic_energy": float(item["elastic_energy"]),
+                    "node_mean_squared_distance": node_msd,
+                    "polyline_length": polyline_length,
+                    "elastic_energy": elastic_energy,
                     "multiplier": float(multiplier),
                     "converged": float(result.converged),
                 }
@@ -332,15 +381,15 @@ class ElasticPrincipalGraph:
                         GraphSnapshot(
                             phase="updated",
                             outer_iteration=int(outer_iteration),
-                            sweep=int(item["sweep"]),
-                            vertices=np.asarray(item["vertices"], dtype=float).copy(),
+                            sweep=sweep,
+                            vertices=sweep_vertices,
                             edges=np.asarray(graph.edges, dtype=int).copy(),
                             mean_squared_distance=msd,
                             root_mean_squared_distance=float(np.sqrt(max(msd, 0.0))),
                             lambda_p=0.0,
                             segments=int(len(graph.edges)),
-                            polyline_length=float(item["polyline_length"]),
-                            elastic_energy=float(item["elastic_energy"]),
+                            polyline_length=polyline_length,
+                            elastic_energy=elastic_energy,
                             operation=None if operation is None else str(operation),
                             construction_complexity=int(construction_complexity),
                             structural_complexity=float(self._structural_complexity(graph)),
@@ -349,11 +398,11 @@ class ElasticPrincipalGraph:
 
         optimized_graph = PrimitiveElasticGraph(
             vertices=current_vertices,
-            edges=[tuple(map(int, e)) for e in graph.edges],
+            edges=[(int(e[0]), int(e[1])) for e in graph.edges],
             lam=float(graph.lam),
             mu=float(graph.mu),
         )
-        objective = self._objective(X, optimized_graph)
+        objective = self._selection_objective(X, optimized_graph)
         return optimized_graph, local_history, local_trace, objective
 
     def _objective(self, X: Array, graph: PrimitiveElasticGraph) -> float:
@@ -365,6 +414,18 @@ class ElasticPrincipalGraph:
             edges=graph.edge_objects(1.0),
             stars=graph.star_objects(1.0, allowed_k_stars=self.config.allowed_k_stars),
         )
+
+    def _projection_objective(self, X: Array, graph: PrimitiveElasticGraph) -> float:
+        projected_msd = _mean_squared_distance_to_graph(X, graph.vertices, graph.edges)
+        elastic_penalty = _elastic_penalty(
+            vertices=graph.vertices,
+            edges=graph.edge_objects(1.0),
+            stars=graph.star_objects(1.0, allowed_k_stars=self.config.allowed_k_stars),
+        )
+        objective = float(projected_msd + elastic_penalty)
+        if not np.isfinite(objective):
+            raise ValueError("Intrinsic projection objective must be finite.")
+        return objective
 
     def _append_trace(
         self,
@@ -439,6 +500,12 @@ def _validate_config(config: ElasticPrincipalGraphConfig) -> None:
         raise ValueError("sc_max must be nonnegative when provided.")
     if config.cc_max is not None and config.cc_max < 0:
         raise ValueError("cc_max must be nonnegative when provided.")
+    if config.intrinsic_topology_max_ops_per_epoch < 1:
+        raise ValueError("intrinsic_topology_max_ops_per_epoch must be at least 1.")
+    if config.intrinsic_topology_ops is not None and len(config.intrinsic_topology_ops) == 0:
+        raise ValueError("intrinsic_topology_ops must be nonempty when provided.")
+    if not isinstance(config.intrinsic_use_projection_score, bool):
+        raise ValueError("intrinsic_use_projection_score must be bool.")
     _validate_allowed_k_stars(config.allowed_k_stars)
     if config.grammar_sequence is not None:
         if len(config.grammar_sequence) == 0:
@@ -485,9 +552,14 @@ def _elastic_energy_from_node_assignments_unweighted(
     stars: List[Star],
 ) -> float:
     msd = float(np.mean(np.sum((X - vertices[assignment]) ** 2, axis=1)))
+    penalty = _elastic_penalty(vertices=vertices, edges=edges, stars=stars)
+    return float(msd + penalty)
+
+
+def _elastic_penalty(vertices: Array, edges: List[Edge], stars: List[Star]) -> float:
     P = _penalty_matrix(vertices.shape[0], edges, stars)
     penalty = 0.0
     for d in range(vertices.shape[1]):
         penalty += float(vertices[:, d].T @ P @ vertices[:, d])
-    return float(msd + penalty)
+    return float(penalty)
 

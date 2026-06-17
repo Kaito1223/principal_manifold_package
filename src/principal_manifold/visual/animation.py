@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Mapping, Optional, Sequence
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -77,9 +77,9 @@ def animate_curve_trace(
         edges = _snapshot_edges(snapshot)
 
         if options["show_structure_segments"] and len(edges) > 0:
-            structure_collection.set_segments(np.stack([vertices2[edges[:, 0]], vertices2[edges[:, 1]]], axis=1))
+            structure_collection.set_segments(np.stack([vertices2[edges[:, 0]], vertices2[edges[:, 1]]], axis=1).tolist())
         else:
-            structure_collection.set_segments(empty_segments)
+            structure_collection.set_segments(empty_segments.tolist())
 
         if options["show_structure_vertices"]:
             vertex_artist.set_offsets(vertices2)
@@ -95,9 +95,9 @@ def animate_curve_trace(
             projected_points_artist.set_offsets(empty_offsets)
 
         if options["show_projections"] and projected2 is not None:
-            projection_lines.set_segments(np.stack([X2, projected2], axis=1))
+            projection_lines.set_segments(np.stack([X2, projected2], axis=1).tolist())
         else:
-            projection_lines.set_segments(empty_segments)
+            projection_lines.set_segments(empty_segments.tolist())
 
         ax.set_title(_build_snapshot_title(snapshot))
         return data_artist, structure_collection, vertex_artist, projected_points_artist, projection_lines
@@ -113,6 +113,7 @@ def save_curve_trace_frames(
     target_dim: Optional[int] = None,
     show_projections: bool = False,
     dpi: int = 150,
+    view_init: Mapping[str, float] | None = None,
 ):
     if len(snapshots) == 0:
         raise ValueError("snapshots must contain at least one snapshot.")
@@ -140,6 +141,7 @@ def save_curve_trace_frames(
             ax=ax,
             target_dim=resolved_dim,
             show_projections=show_projections,
+            view_init=view_init,
         )
 
         filename = f"{idx:03d}_outer_{snapshot.outer_iteration:03d}_{snapshot.phase}"
@@ -152,7 +154,13 @@ def save_curve_trace_frames(
         plt.close(fig)
 
 
-def frames_to_gif(frames_dir, output_path="trace_steps/evolution.gif", pattern="*.png", duration=400, loop=0):
+def frames_to_gif(
+    frames_dir,
+    output_path: str | Path = "trace_steps/evolution.gif",
+    pattern="*.png",
+    duration=400,
+    loop=0,
+):
     frames_dir = Path(frames_dir)
     output_path = Path(output_path)
 
@@ -166,7 +174,14 @@ def frames_to_gif(frames_dir, output_path="trace_steps/evolution.gif", pattern="
     first.save(output_path, save_all=True, append_images=rest, duration=duration, loop=loop, optimize=False)
 
 
-def save_trace_gif(X: Array, snapshots, method_name: str, output_dir: Path, gif_name: str) -> Path:
+def save_trace_gif(
+    X: Array,
+    snapshots,
+    method_name: str,
+    output_dir: Path,
+    gif_name: str,
+    view_init: Mapping[str, float] | None = None,
+) -> Path:
     save_curve_trace_frames(
         X=X,
         snapshots=snapshots,
@@ -175,6 +190,7 @@ def save_trace_gif(X: Array, snapshots, method_name: str, output_dir: Path, gif_
         target_dim=3,
         show_projections=False,
         dpi=140,
+        view_init=view_init,
     )
     gif_path = output_dir / gif_name
     frames_to_gif(frames_dir=output_dir, output_path=gif_path, duration=450)

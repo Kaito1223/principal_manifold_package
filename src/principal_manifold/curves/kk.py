@@ -5,7 +5,10 @@ from typing import Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
-import torch
+try:
+    import torch
+except ImportError:  # pragma: no cover - exercised indirectly in environments without torch
+    torch = None
 
 from .._types import (
     CurveSnapshot,

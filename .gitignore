@@ -9,3 +9,9 @@ dist/
 *.npy
 *.json
 *.npz
+.opencode
+AGENTS.md
+opencode.json
+learnings
+uv.lock
+.omo/
